@@ -1,0 +1,11 @@
+{
+  "name": "sugaropl4-wasm",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "asc assembly/index.ts -o ../sugaropl4.wasm -O3 --converge --noAssert --runtime stub --initialMemory 160"
+  },
+  "devDependencies": {
+    "assemblyscript": "0.28.20"
+  }
+}
