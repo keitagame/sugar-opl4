@@ -1017,3 +1017,264 @@ export function render(count: i32): void {
     unchecked(OUT_L[i] = l); unchecked(OUT_R[i] = r);
   }
 }
+
+// =====================================================================
+//  SpatialFX (ステレオ拡張 / 初期反射 / FDN リバーブ / クロスフィード / リミッタ)
+//  パラメータ導出は JS 側 (SpatialFX.set) で行い、FXP 経由で受け取る。状態と処理だけここ。
+// =====================================================================
+const FXP = new StaticArray<f64>(32);   // 0 enabled 1 decorrelate 2 width 3 crossfeed 4 early 5 reverb 6 limiter 7 pdLen 8 dDamp 9..16 dLen 17..24 dG
+const F_OUT_L = new StaticArray<f32>(BLOCK_MAX);
+const F_OUT_R = new StaticArray<f32>(BLOCK_MAX);
+
+function nextPow2(n: i32): i32 { let p = 1; while (p < n) p <<= 1; return p; }
+
+class Allpass {
+  buf!: Float32Array; len: i32 = 0; i: i32 = 0; g: f64 = 0;
+  constructor(len: i32, g: f64) { this.len = max(1, len); this.buf = new Float32Array(this.len); this.g = g; }
+  @inline process(x: f64): f64 {
+    const b = this.buf.dataStart, i = this.i;
+    const wd = <f64>load<f32>(b + (<usize>i << 2));
+    const w = x + this.g * wd;
+    store<f32>(b + (<usize>i << 2), <f32>w);
+    this.i = i + 1 >= this.len ? 0 : i + 1;
+    return wd - this.g * w;
+  }
+  reset(): void { this.buf.fill(0); this.i = 0; }
+}
+
+class FX {
+  sr: f64 = 0;
+  outL: f64 = 0; outR: f64 = 0;
+  apL: Array<Allpass> = new Array<Allpass>(); apR: Array<Allpass> = new Array<Allpass>();
+  sLp: f64 = 0; mLp: f64 = 0; aSide: f64 = 0;
+  erSize: i32 = 0; erMask: i32 = 0; erBufL!: Float32Array; erBufR!: Float32Array; erPos: i32 = 0;
+  erDL: StaticArray<i32> = new StaticArray<i32>(6); erXL: StaticArray<i32> = new StaticArray<i32>(6); erGL: StaticArray<f64> = new StaticArray<f64>(6);
+  erDR: StaticArray<i32> = new StaticArray<i32>(6); erXR: StaticArray<i32> = new StaticArray<i32>(6); erGR: StaticArray<f64> = new StaticArray<f64>(6);
+  erLpL: f64 = 0; erLpR: f64 = 0; aEr: f64 = 0;
+  pdSize: i32 = 0; pdMask: i32 = 0; pdL!: Float32Array; pdR!: Float32Array; pdPos: i32 = 0;
+  revHpL: f64 = 0; revHpR: f64 = 0; aRevHp: f64 = 0;
+  modDepth: f64 = 0; dSize: i32 = 0;
+  dBuf!: Float32Array;                                  // 8 本を連結 (i * dSize)
+  dPos: StaticArray<i32> = new StaticArray<i32>(8);
+  dLen: StaticArray<f64> = new StaticArray<f64>(8);
+  dG: StaticArray<f64> = new StaticArray<f64>(8);
+  dLp: StaticArray<f64> = new StaticArray<f64>(8);
+  dTmp: StaticArray<f64> = new StaticArray<f64>(8);
+  dY: StaticArray<f64> = new StaticArray<f64>(8);
+  lfoPh: StaticArray<f64> = new StaticArray<f64>(8);
+  lfoInc: StaticArray<f64> = new StaticArray<f64>(8);
+  cfLpL: f64 = 0; cfLpR: f64 = 0; aCf: f64 = 0;
+  limN: i32 = 0; limL!: Float32Array; limR!: Float32Array; limI: i32 = 0; limGain: f64 = 1;
+  limAtk: f64 = 0; limRel: f64 = 0; limThr: f64 = 0.84;
+  // パラメータ
+  enabled: bool = true; decorrelate: f64 = 0; width: f64 = 1; crossfeed: f64 = 0; early: f64 = 0; reverb: f64 = 0;
+  limiter: bool = true; pdLen: i32 = 1; dDamp: f64 = 0.4;
+
+  constructor(sr: f64) {
+    this.sr = sr;
+    const k = sr / 48000;
+    const apLens: StaticArray<i32> = [142, 107, 379, 277], apLensR: StaticArray<i32> = [151, 113, 397, 293];
+    for (let i = 0; i < 4; i++) {
+      this.apL.push(new Allpass(<i32>Math.round(<f64>apLens[i] * k), 0.5));
+      this.apR.push(new Allpass(<i32>Math.round(<f64>apLensR[i] * k), 0.5));
+    }
+    this.aSide = 1 - Math.exp(-2 * Math.PI * 160 / sr);
+
+    this.erSize = nextPow2(<i32>Math.ceil(0.09 * sr));
+    this.erMask = this.erSize - 1;
+    this.erBufL = new Float32Array(this.erSize); this.erBufR = new Float32Array(this.erSize);
+    const tL: StaticArray<f64> = [7.1, 12.9, 19.3, 26.7, 35.9, 47.3], tR: StaticArray<f64> = [8.9, 14.3, 21.7, 29.9, 39.1, 51.7];
+    const gains: StaticArray<f64> = [.50, -.42, .34, -.28, .22, -.16];
+    for (let i = 0; i < 6; i++) {
+      this.erDL[i] = <i32>Math.round(tL[i] * 0.001 * sr); this.erXL[i] = i & 1; this.erGL[i] = gains[i];
+      this.erDR[i] = <i32>Math.round(tR[i] * 0.001 * sr); this.erXR[i] = i & 1; this.erGR[i] = gains[i];
+    }
+    this.aEr = 1 - Math.exp(-2 * Math.PI * 7000 / sr);
+
+    this.pdSize = nextPow2(<i32>Math.ceil(0.2 * sr));
+    this.pdMask = this.pdSize - 1;
+    this.pdL = new Float32Array(this.pdSize); this.pdR = new Float32Array(this.pdSize);
+    this.aRevHp = 1 - Math.exp(-2 * Math.PI * 180 / sr);
+
+    this.modDepth = 4 * k;
+    this.dSize = <i32>Math.ceil(2731.0 * k * 1.6) + <i32>Math.ceil(this.modDepth) + 8;
+    this.dBuf = new Float32Array(8 * this.dSize);
+    const rates: StaticArray<f64> = [0.17, 0.23, 0.29, 0.31, 0.37, 0.41, 0.43, 0.47];
+    for (let i = 0; i < 8; i++) { this.lfoPh[i] = <f64>i * 0.7; this.lfoInc[i] = 2 * Math.PI * rates[i] / sr; }
+
+    this.aCf = 1 - Math.exp(-2 * Math.PI * 700 / sr);
+
+    this.limN = max(2, <i32>Math.round(0.0015 * sr));
+    this.limL = new Float32Array(this.limN); this.limR = new Float32Array(this.limN);
+    this.limAtk = 1 - Math.exp(-1 / (0.00025 * sr));
+    this.limRel = 1 - Math.exp(-1 / (0.12 * sr));
+  }
+
+  applyParams(): void {
+    this.enabled = FXP[0] != 0;
+    this.decorrelate = FXP[1]; this.width = FXP[2]; this.crossfeed = FXP[3];
+    this.early = FXP[4]; this.reverb = FXP[5]; this.limiter = FXP[6] != 0;
+    this.pdLen = <i32>FXP[7]; this.dDamp = FXP[8];
+    for (let i = 0; i < 8; i++) { this.dLen[i] = FXP[9 + i]; this.dG[i] = FXP[17 + i]; }
+  }
+
+  reset(): void {
+    for (let i = 0; i < 4; i++) { this.apL[i].reset(); this.apR[i].reset(); }
+    this.erBufL.fill(0); this.erBufR.fill(0); this.pdL.fill(0); this.pdR.fill(0); this.dBuf.fill(0);
+    for (let i = 0; i < 8; i++) this.dLp[i] = 0;
+    this.limL.fill(0); this.limR.fill(0);
+    this.sLp = 0; this.mLp = 0; this.erLpL = 0; this.erLpR = 0;
+    this.revHpL = 0; this.revHpR = 0; this.cfLpL = 0; this.cfLpR = 0;
+    this.limGain = 1;
+  }
+
+  process(inL: f64, inR: f64): void {
+    if (!this.enabled) { this.outL = inL; this.outR = inR; return; }
+
+    // 1) ステレオ拡張
+    const M = (inL + inR) * 0.5, S = (inL - inR) * 0.5;
+    this.sLp += (S - this.sLp) * this.aSide;
+    this.mLp += (M - this.mLp) * this.aSide;
+    const sHp = S - this.sLp, mHp = M - this.mLp;
+    let dec: f64 = 0;
+    if (this.decorrelate > 0) {
+      let a = mHp, b = mHp;
+      for (let i = 0; i < 4; i++) { a = unchecked(this.apL[i]).process(a); b = unchecked(this.apR[i]).process(b); }
+      dec = (a - b) * 0.5 * this.decorrelate;
+    }
+    const S2 = this.sLp + this.width * (sHp + dec);
+    let l = M + S2, r = M - S2;
+
+    // 4) クロスフィード
+    if (this.crossfeed > 0) {
+      this.cfLpL += (l - this.cfLpL) * this.aCf;
+      this.cfLpR += (r - this.cfLpR) * this.aCf;
+      const cf = this.crossfeed, nrm = 1 / (1 + cf * 0.6);
+      const l2 = (l + cf * this.cfLpR) * nrm, r2 = (r + cf * this.cfLpL) * nrm;
+      l = l2; r = r2;
+    }
+
+    // 2) 初期反射
+    let erL: f64 = 0, erR: f64 = 0;
+    if (this.early > 0) {
+      const ep = this.erPos, em = this.erMask;
+      const bl = this.erBufL.dataStart, br = this.erBufR.dataStart;
+      store<f32>(bl + (<usize>ep << 2), <f32>l); store<f32>(br + (<usize>ep << 2), <f32>r);
+      for (let i = 0; i < 6; i++) {
+        const src = unchecked(this.erXL[i]) ? br : bl;
+        erL += unchecked(this.erGL[i]) * <f64>load<f32>(src + (<usize>((ep - unchecked(this.erDL[i])) & em) << 2));
+      }
+      for (let i = 0; i < 6; i++) {
+        const src = unchecked(this.erXR[i]) ? bl : br;
+        erR += unchecked(this.erGR[i]) * <f64>load<f32>(src + (<usize>((ep - unchecked(this.erDR[i])) & em) << 2));
+      }
+      this.erPos = (ep + 1) & em;
+      this.erLpL += (erL - this.erLpL) * this.aEr; erL = this.erLpL;
+      this.erLpR += (erR - this.erLpR) * this.aEr; erR = this.erLpR;
+    }
+
+    // 3) FDN リバーブ
+    let wetL: f64 = 0, wetR: f64 = 0;
+    if (this.reverb > 0) {
+      this.revHpL += (l - this.revHpL) * this.aRevHp;
+      this.revHpR += (r - this.revHpR) * this.aRevHp;
+      const pp = this.pdPos, pm = this.pdMask;
+      const pl = this.pdL.dataStart, pr = this.pdR.dataStart;
+      store<f32>(pl + (<usize>pp << 2), <f32>(l - this.revHpL));
+      store<f32>(pr + (<usize>pp << 2), <f32>(r - this.revHpR));
+      const rp = (pp - this.pdLen) & pm;
+      const xl = <f64>load<f32>(pl + (<usize>rp << 2)), xr = <f64>load<f32>(pr + (<usize>rp << 2));
+      this.pdPos = (pp + 1) & pm;
+
+      const damp = this.dDamp, ia = 1 - damp, size = this.dSize;
+      const db = this.dBuf.dataStart;
+      for (let i = 0; i < 8; i++) {
+        const base = db + (<usize>(i * size) << 2);
+        const mod = this.modDepth * Math.sin(unchecked(this.lfoPh[i]));
+        let ph = unchecked(this.lfoPh[i]) + unchecked(this.lfoInc[i]);
+        if (ph > 6.283185307179586) ph -= 6.283185307179586;
+        unchecked(this.lfoPh[i] = ph);
+        let pos = <f64>unchecked(this.dPos[i]) - (unchecked(this.dLen[i]) + mod);
+        while (pos < 0) pos += <f64>size;
+        const i0 = <i32>pos, fr = pos - <f64>i0;
+        const i1 = i0 + 1 >= size ? 0 : i0 + 1;
+        const b0 = <f64>load<f32>(base + (<usize>i0 << 2));
+        const v = b0 + (<f64>load<f32>(base + (<usize>i1 << 2)) - b0) * fr;
+        unchecked(this.dY[i] = v);
+        const lp = ia * v + damp * unchecked(this.dLp[i]);
+        unchecked(this.dLp[i] = lp);
+        unchecked(this.dTmp[i] = lp * unchecked(this.dG[i]));
+      }
+      const tmp = this.dTmp;
+      for (let h = 1; h < 8; h <<= 1) {
+        for (let i = 0; i < 8; i += h << 1) {
+          for (let j = i; j < i + h; j++) { const a = unchecked(tmp[j]), b = unchecked(tmp[j + h]); unchecked(tmp[j] = a + b); unchecked(tmp[j + h] = a - b); }
+        }
+      }
+      const IN = 0.9, SC = 0.35355339059327373;
+      for (let i = 0; i < 8; i++) {
+        const base = db + (<usize>(i * size) << 2);
+        const dp = unchecked(this.dPos[i]);
+        store<f32>(base + (<usize>dp << 2), <f32>(unchecked(tmp[i]) * SC + ((i & 1) ? xr : xl) * IN));
+        unchecked(this.dPos[i] = dp + 1 >= size ? 0 : dp + 1);
+      }
+      const y = this.dY;
+      wetL = (unchecked(y[0]) + unchecked(y[2]) + unchecked(y[4]) + unchecked(y[6])) * 0.5;
+      wetR = (unchecked(y[1]) + unchecked(y[3]) + unchecked(y[5]) + unchecked(y[7])) * 0.5;
+    }
+
+    let oL = l + this.early * erL + this.reverb * wetL;
+    let oR = r + this.early * erR + this.reverb * wetR;
+
+    // 5) リミッタ
+    if (this.limiter) {
+      const peak = Math.max(Math.abs(oL), Math.abs(oR));
+      const target = peak > this.limThr ? this.limThr / peak : 1;
+      this.limGain += (target - this.limGain) * (target < this.limGain ? this.limAtk : this.limRel);
+      const li = this.limI;
+      const dl = <f64>this.limL[li], dr = <f64>this.limR[li];
+      this.limL[li] = <f32>oL; this.limR[li] = <f32>oR;
+      this.limI = li + 1 >= this.limN ? 0 : li + 1;
+      oL = dl * this.limGain; oR = dr * this.limGain;
+    }
+    this.outL = oL; this.outR = oR;
+  }
+}
+
+function softOut(x: f64): f64 {
+  const T = 0.85;
+  if (x > T) return T + (1 - T) * Math.tanh((x - T) / (1 - T));
+  if (x < -T) return -T - (1 - T) * Math.tanh((-x - T) / (1 - T));
+  return x;
+}
+
+let fx: FX | null = null;
+
+export function fxParamsPtr(): usize { return changetype<usize>(FXP); }
+export function fOutLPtr(): usize { return changetype<usize>(F_OUT_L); }
+export function fOutRPtr(): usize { return changetype<usize>(F_OUT_R); }
+/** sr 用に FX を(再)生成。直後に FXP を書いて fxApply() を呼ぶこと */
+export function fxInit(sr: f64): void { fx = new FX(sr); }
+export function fxApply(): void { if (fx) fx!.applyParams(); }
+export function fxReset(): void { if (fx) fx!.reset(); }
+
+/** OUT_L/OUT_R (チップ出力) → FX → ソフトクリップ → F_OUT_L/R (f32) */
+export function fxRun(count: i32): void {
+  const f = fx!;
+  const n = count > BLOCK_MAX ? BLOCK_MAX : count;
+  for (let i = 0; i < n; i++) {
+    f.process(unchecked(OUT_L[i]), unchecked(OUT_R[i]));
+    unchecked(F_OUT_L[i] = <f32>softOut(f.outL));
+    unchecked(F_OUT_R[i] = <f32>softOut(f.outR));
+  }
+}
+/** 無音入力で FX だけ回す (停止中の残響) */
+export function fxSilence(count: i32): void {
+  const f = fx!;
+  const n = count > BLOCK_MAX ? BLOCK_MAX : count;
+  for (let i = 0; i < n; i++) {
+    f.process(0, 0);
+    unchecked(F_OUT_L[i] = <f32>softOut(f.outL));
+    unchecked(F_OUT_R[i] = <f32>softOut(f.outR));
+  }
+}
