@@ -46,7 +46,7 @@ function cubic(a: f64, b: f64, c: f64, d: f64, t: f64): f64 {
 
 // ---- 共有メモリ (ROM/RAM 4MB) / 入出力バッファ ----
 const MEM_PTR: usize = memory.data(MEM_SIZE);
-const PARAMS = new StaticArray<f64>(16);
+const PARAMS = new StaticArray<f64>(32);
 const OUT_L = new StaticArray<f64>(BLOCK_MAX);
 const OUT_R = new StaticArray<f64>(BLOCK_MAX);
 
@@ -62,6 +62,9 @@ class FmQ {
   lfoSmooth: bool = true; softKeyOn: bool = true;
   deharsh: f64 = 0.55; deharshThr: f64 = 0.045; deharshHz: f64 = 2800;
   shelfDb: f64 = -2; shelfHz: f64 = 6500; rhythmLpHz: f64 = 11000;
+  // 透明感重視の追加パラメータ (0 = 無効 → 従来どおりの音)
+  presenceDb: f64 = 0; presenceHz: f64 = 4500; presenceQ: f64 = 0.9; airDb: f64 = 0; airHz: f64 = 10000;
+  deharshHiHz: f64 = 0; deharshAtkMs: f64 = 0; deharshRelMs: f64 = 0;
 }
 function readQ(): FmQ {
   const q = new FmQ();
@@ -69,6 +72,9 @@ function readQ(): FmQ {
   q.lfoSmooth = PARAMS[4] != 0; q.softKeyOn = PARAMS[5] != 0;
   q.deharsh = PARAMS[6]; q.deharshThr = PARAMS[7]; q.deharshHz = PARAMS[8];
   q.shelfDb = PARAMS[9]; q.shelfHz = PARAMS[10]; q.rhythmLpHz = PARAMS[11];
+  q.presenceDb = PARAMS[12]; q.presenceHz = PARAMS[13]; q.presenceQ = PARAMS[14];
+  q.airDb = PARAMS[15]; q.airHz = PARAMS[16];
+  q.deharshHiHz = PARAMS[17]; q.deharshAtkMs = PARAMS[18]; q.deharshRelMs = PARAMS[19];
   return q;
 }
 
@@ -178,52 +184,122 @@ class HalfbandDec {
   }
 }
 
-// ---- トーン整形 ----
+// ---- トーン整形: EQ (シェルフ/ピーキング) + 帯域限定ダイナミック抑制 (ディエッサ的) ----
+class Biquad {                            // モノラル 1 段 (直接形 I)
+  b0: f64 = 1; b1: f64 = 0; b2: f64 = 0; a1: f64 = 0; a2: f64 = 0;
+  x1: f64 = 0; x2: f64 = 0; y1: f64 = 0; y2: f64 = 0;
+  reset(): void { this.x1 = 0; this.x2 = 0; this.y1 = 0; this.y2 = 0; }
+  set(b0: f64, b1: f64, b2: f64, a0: f64, a1: f64, a2: f64): void {
+    this.b0 = b0 / a0; this.b1 = b1 / a0; this.b2 = b2 / a0; this.a1 = a1 / a0; this.a2 = a2 / a0;
+  }
+  highShelf(fs: f64, dB: f64, hz: f64): void {      // RBJ ハイシェルフ (S = 1)
+    const A = Math.pow(10, dB / 40), w0 = 2 * Math.PI * hz / fs;
+    const cs = Math.cos(w0), al = Math.sin(w0) / 2 * Math.SQRT2, sA = 2 * Math.sqrt(A) * al;
+    this.set(A * ((A + 1) + (A - 1) * cs + sA), -2 * A * ((A - 1) + (A + 1) * cs), A * ((A + 1) + (A - 1) * cs - sA),
+             (A + 1) - (A - 1) * cs + sA, 2 * ((A - 1) - (A + 1) * cs), (A + 1) - (A - 1) * cs - sA);
+  }
+  peak(fs: f64, dB: f64, hz: f64, Q: f64): void {   // RBJ ピーキング
+    const A = Math.pow(10, dB / 40), w0 = 2 * Math.PI * hz / fs, cs = Math.cos(w0), al = Math.sin(w0) / (2 * Q);
+    this.set(1 + al * A, -2 * cs, 1 - al * A, 1 + al / A, -2 * cs, 1 - al / A);
+  }
+  lowpass(fs: f64, hz: f64): void {                 // 2次バタワース
+    const w0 = 2 * Math.PI * hz / fs, cs = Math.cos(w0), al = Math.sin(w0) / Math.SQRT2;
+    this.set((1 - cs) / 2, 1 - cs, (1 - cs) / 2, 1 + al, -2 * cs, 1 - al);
+  }
+  highpass(fs: f64, hz: f64): void {                // 2次バタワース
+    const w0 = 2 * Math.PI * hz / fs, cs = Math.cos(w0), al = Math.sin(w0) / Math.SQRT2;
+    this.set((1 + cs) / 2, -(1 + cs), (1 + cs) / 2, 1 + al, -2 * cs, 1 - al);
+  }
+  @inline run(x: f64): f64 {
+    const y = this.b0 * x + this.b1 * this.x1 + this.b2 * this.x2 - this.a1 * this.y1 - this.a2 * this.y2;
+    this.x2 = this.x1; this.x1 = x; this.y2 = this.y1; this.y1 = y;
+    return y;
+  }
+}
+
+class Lr4 {                               // Linkwitz-Riley 4次 = 2次バタワース2段
+  a: Biquad = new Biquad(); b: Biquad = new Biquad();
+  lp(fs: f64, hz: f64): void { this.a.lowpass(fs, hz); this.b.lowpass(fs, hz); }
+  hp(fs: f64, hz: f64): void { this.a.highpass(fs, hz); this.b.highpass(fs, hz); }
+  reset(): void { this.a.reset(); this.b.reset(); }
+  @inline run(x: f64): f64 { return this.b.run(this.a.run(x)); }
+}
+
+/** 1 チャンネル分の 3 バンド LR4 分割。low + mid + high は全域通過 (位相整合済み) */
+class Split3 {
+  lo1: Lr4 = new Lr4(); hp1: Lr4 = new Lr4();          // f1 での LP / HP
+  midLp: Lr4 = new Lr4(); hiHp: Lr4 = new Lr4();       // f2 での LP / HP (hp1 の出力に適用)
+  cmpLp: Lr4 = new Lr4(); cmpHp: Lr4 = new Lr4();      // 低域を f2 の全域通過に通して位相を揃える
+  low: f64 = 0; mid: f64 = 0; high: f64 = 0;
+  reset(): void {
+    this.lo1.reset(); this.hp1.reset(); this.midLp.reset(); this.hiHp.reset(); this.cmpLp.reset(); this.cmpHp.reset();
+  }
+  setup(fs: f64, f1: f64, f2: f64): void {
+    this.lo1.lp(fs, f1); this.hp1.hp(fs, f1);
+    this.midLp.lp(fs, f2); this.hiHp.hp(fs, f2);
+    this.cmpLp.lp(fs, f2); this.cmpHp.hp(fs, f2);
+  }
+  run(x: f64): void {
+    const lo = this.lo1.run(x), hp = this.hp1.run(x);
+    this.mid = this.midLp.run(hp); this.high = this.hiHp.run(hp);
+    this.low = this.cmpLp.run(lo) + this.cmpHp.run(lo);
+  }
+}
+
 class FmTone {
   rate: f64; oL: f64 = 0; oR: f64 = 0;
-  x1L: f64 = 0; x2L: f64 = 0; y1L: f64 = 0; y2L: f64 = 0;
-  x1R: f64 = 0; x2R: f64 = 0; y1R: f64 = 0; y2R: f64 = 0;
+  shelfL: Biquad = new Biquad(); shelfR: Biquad = new Biquad();
+  presL: Biquad = new Biquad(); presR: Biquad = new Biquad();
+  airL: Biquad = new Biquad(); airR: Biquad = new Biquad();
+  sL: Split3 = new Split3(); sR: Split3 = new Split3();
+  shelfOn: bool = false; presOn: bool = false; airOn: bool = false;
   lpAL: f64 = 0; lpBL: f64 = 0; lpAR: f64 = 0; lpBR: f64 = 0; env: f64 = 0;
-  shelfOn: bool = false; b0: f64 = 0; b1: f64 = 0; b2: f64 = 0; a1: f64 = 0; a2: f64 = 0;
-  dhOn: bool = false; dhThr: f64 = 0; dhExp: f64 = 0; aLp: f64 = 0; aAtk: f64 = 0; aRel: f64 = 0;
+  dhOn: bool = false; dhBand: bool = false; dhThr: f64 = 0; dhExp: f64 = 0; aLp: f64 = 0; aAtk: f64 = 0; aRel: f64 = 0;
   constructor(rate: f64) { this.rate = rate; }
   setup(q: FmQ): void {
     const fs = this.rate;
-    this.shelfOn = q.shelfDb != 0;
-    if (this.shelfOn) {
-      const A = Math.pow(10, q.shelfDb / 40), w0 = 2 * Math.PI * q.shelfHz / fs;
-      const cs = Math.cos(w0), al = Math.sin(w0) / 2 * Math.SQRT2, sA = 2 * Math.sqrt(A) * al;
-      const a0 = (A + 1) - (A - 1) * cs + sA;
-      this.b0 = A * ((A + 1) + (A - 1) * cs + sA) / a0;
-      this.b1 = -2 * A * ((A - 1) + (A + 1) * cs) / a0;
-      this.b2 = A * ((A + 1) + (A - 1) * cs - sA) / a0;
-      this.a1 = 2 * ((A - 1) - (A + 1) * cs) / a0;
-      this.a2 = ((A + 1) - (A - 1) * cs - sA) / a0;
+    this.shelfOn = q.shelfDb != 0; this.presOn = q.presenceDb != 0; this.airOn = q.airDb != 0;
+    if (this.shelfOn) { this.shelfL.highShelf(fs, q.shelfDb, q.shelfHz); this.shelfR.highShelf(fs, q.shelfDb, q.shelfHz); }
+    if (this.presOn) {
+      const Q = q.presenceQ > 0 ? q.presenceQ : 0.9;
+      this.presL.peak(fs, q.presenceDb, q.presenceHz, Q); this.presR.peak(fs, q.presenceDb, q.presenceHz, Q);
     }
+    if (this.airOn) { this.airL.highShelf(fs, q.airDb, q.airHz); this.airR.highShelf(fs, q.airDb, q.airHz); }
     this.dhOn = q.deharsh > 0;
     this.dhThr = q.deharshThr;
     this.dhExp = 1 - 1 / (1 + 5 * q.deharsh);
     this.aLp = 1 - Math.exp(-2 * Math.PI * q.deharshHz / fs);
-    this.aAtk = 1 - Math.exp(-1 / (0.001 * fs));
-    this.aRel = 1 - Math.exp(-1 / (0.05 * fs));
+    this.dhBand = q.deharshHiHz > q.deharshHz;
+    if (this.dhBand) {
+      const f2 = Math.min(q.deharshHiHz, fs * 0.42);
+      this.sL.setup(fs, q.deharshHz, f2); this.sR.setup(fs, q.deharshHz, f2);
+    }
+    this.aAtk = 1 - Math.exp(-1 / ((q.deharshAtkMs > 0 ? q.deharshAtkMs : 1) * 0.001 * fs));
+    this.aRel = 1 - Math.exp(-1 / ((q.deharshRelMs > 0 ? q.deharshRelMs : 50) * 0.001 * fs));
   }
   process(inL: f64, inR: f64): void {
     let l = inL, r = inR;
-    if (this.shelfOn) {
-      const yl = this.b0 * l + this.b1 * this.x1L + this.b2 * this.x2L - this.a1 * this.y1L - this.a2 * this.y2L;
-      this.x2L = this.x1L; this.x1L = l; this.y2L = this.y1L; this.y1L = yl; l = yl;
-      const yr = this.b0 * r + this.b1 * this.x1R + this.b2 * this.x2R - this.a1 * this.y1R - this.a2 * this.y2R;
-      this.x2R = this.x1R; this.x1R = r; this.y2R = this.y1R; this.y1R = yr; r = yr;
-    }
+    if (this.shelfOn) { l = this.shelfL.run(l); r = this.shelfR.run(r); }
+    if (this.presOn) { l = this.presL.run(l); r = this.presR.run(r); }
+    if (this.airOn) { l = this.airL.run(l); r = this.airR.run(r); }
     if (this.dhOn) {
-      const a = this.aLp;
-      this.lpAL += (l - this.lpAL) * a; this.lpBL += (this.lpAL - this.lpBL) * a;
-      this.lpAR += (r - this.lpAR) * a; this.lpBR += (this.lpAR - this.lpBR) * a;
-      const hL = l - this.lpBL, hR = r - this.lpBR;
-      const e = Math.max(Math.abs(hL), Math.abs(hR));
-      this.env += (e - this.env) * (e > this.env ? this.aAtk : this.aRel);
-      const g = this.env > this.dhThr ? Math.pow(this.dhThr / this.env, this.dhExp) : 1;
-      l = this.lpBL + hL * g; r = this.lpBR + hR * g;
+      if (this.dhBand) {
+        const sl = this.sL, sr = this.sR;
+        sl.run(l); sr.run(r);
+        const e = Math.max(Math.abs(sl.mid), Math.abs(sr.mid));
+        this.env += (e - this.env) * (e > this.env ? this.aAtk : this.aRel);
+        const g = this.env > this.dhThr ? Math.pow(this.dhThr / this.env, this.dhExp) : 1;
+        l = sl.low + g * sl.mid + sl.high; r = sr.low + g * sr.mid + sr.high;
+      } else {
+        const a = this.aLp;
+        this.lpAL += (l - this.lpAL) * a; this.lpBL += (this.lpAL - this.lpBL) * a;
+        this.lpAR += (r - this.lpAR) * a; this.lpBR += (this.lpAR - this.lpBR) * a;
+        const hL = l - this.lpBL, hR = r - this.lpBR;
+        const e = Math.max(Math.abs(hL), Math.abs(hR));
+        this.env += (e - this.env) * (e > this.env ? this.aAtk : this.aRel);
+        const g = this.env > this.dhThr ? Math.pow(this.dhThr / this.env, this.dhExp) : 1;
+        l = this.lpBL + hL * g; r = this.lpBR + hR * g;
+      }
     }
     this.oL = l; this.oR = r;
   }
